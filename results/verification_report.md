@@ -89,7 +89,7 @@ POST https://openrouter.ai/api/v1/chat/completions
 
 **응답 필드명/타입**
 - `usage.prompt_tokens`(int), `completion_tokens`(int), `total_tokens`(int), `cost`(float)
-- 하위 상세 객체 2개: `prompt_tokens_details`(dict), `completion_tokens_details`(dict) — 각각 cache/audio/video, reasoning/image/audio로 세분화
+- 하위 상세 객체 2개: `prompt_tokens_details`(dict), `completion_tokens_details`(dict) — 각각 cache/audio/video, reasoning/image/audio로 세분화 (⚠️ 상위 값에 **포함된** 내역이며 별도 합산 값 아님 — 근거는 API-04 참고)
 - `cost_details`(dict) — provider 원가 세부 분해
 
 **DB 설계에 미치는 영향**
@@ -129,16 +129,31 @@ GET https://openrouter.ai/api/v1/generation?id=gen-...
 ```
 
 **응답 필드명/타입**
-- `total_cost`(float), `tokens_prompt`/`tokens_completion`(int, 과금 기준) vs `native_tokens_prompt`/`native_tokens_completion`(int, provider 실제 기준) — **두 값이 다를 수 있음**
+- `total_cost`(float), `native_tokens_prompt`/`native_tokens_completion`(int, provider 실제 토큰 — **비용 계산과 일치, 아래 검증 참고**) vs `tokens_prompt`/`tokens_completion`(int, OpenRouter 자체 별도 집계로 추정, 비용과 불일치)
 - `provider_responses`(list[dict]), `cache_discount`(float/null)
 
-**DB 설계에 미치는 영향**
-- 과금 기준 토큰(`tokens_*`)과 provider 실제 토큰(`native_tokens_*`)이 분리되어 있음 → 어느 값을 기준으로 삼을지 명확히 정하고 둘 다 저장 고려
+**DB 설계에 미치는 영향 (⚠️ 1차 검증 오류를 재검증으로 수정함)**
+
+처음엔 `/models` 목록의 대표 가격으로 계산해서 "`/generation`의 `tokens_prompt`가 비용과 맞는다"고 결론 내렸는데, **실제 처리 provider(DekaLLM)의 개별 단가**(`GET /models/mistralai/mistral-nemo/endpoints`로 조회)로 다시 계산하니 결론이 **반대로** 나왔습니다:
+
+- DekaLLM 실제 단가: prompt `$0.000000018`/토큰, completion `$0.00000003`/토큰 (`/models` 목록의 대표가 `$0.000000029`와 다름 — 그건 DeepInfra 단가였음)
+- 채팅 완료 응답의 `prompt_tokens=16, completion_tokens=2`(=`native_tokens_*`)로 계산 → `16×0.000000018 + 2×0.00000003 = 3.48e-7` → **실제 청구액(3.48e-7)과 정확히 일치**
+- `/generation`의 `tokens_prompt=11, tokens_completion=1`로 계산 → `2.28e-7` → **불일치**
+- **API-04 호출(Novita, 긴 프롬프트)로 교차 검증**: `native_tokens_prompt=3622, completion=100`(캐시분 3584 포함)에 Novita 단가(prompt `$0.000000021`, completion `$0.000000063`, `input_cache_read` `$0.0000000042`)를 적용하면 1차 `8.2362e-05`, 2차 `2.21508e-05` 모두 **실제 청구액과 정확히 일치**. 반면 그 호출들의 `/generation` `tokens_prompt`는 `4450`으로 오히려 native보다 **더 큼** (API-02 때는 반대로 작았음 — 방향성이 일관되지 않음)
+
+**정정된 결론**: **채팅 완료 응답 자체의 `usage.prompt_tokens`/`completion_tokens`(=native 토큰) + 실제 처리 provider의 개별 단가**를 쓰면 비용이 정확히 재계산됩니다. `/generation`의 `tokens_prompt`/`tokens_completion`은 방향성이 일관되지 않아 **OpenRouter 자체의 별도 집계(다른 토크나이저 등)로 추정되며, 비용 재계산용으로 쓰면 안 됩니다.**
+→ **DB에는 채팅 완료 응답의 `usage.prompt_tokens`/`completion_tokens`를 비용 검증 기준 컬럼으로 저장**하고, 비용 재계산이 필요하면 **처리 provider명(`provider`)별로 `/endpoints`의 단가를 조인**해야 함 (모델 단위 대표가로는 안 됨)
+
 - 1·2차 조회(15초 간격) 사이에는 `total_cost` 값이 변하지 않음을 확인
 
 **추가 확인**
 - 1차 조회 자체가 실제 호출 후 몇 분 지나서 이뤄져서, "호출 직후 즉시 반영되는지"는 이번 테스트로 확정 불가 (최소 수 분 내에는 반영되어 있음만 확인)
 - 요청 시 `stream` 파라미터를 지정하지 않았는데도 응답의 `streamed` 필드가 `true`로 나옴 — 원인 미확인
+- `upstream_inference_cost`가 채팅 완료 응답(`cost_details.upstream_inference_cost=3.48e-07`, `total_cost`와 동일)과 `/generation` 조회(`upstream_inference_cost=0`)에서 다름 — 공식 문서(필드 설명: "Cost charged by the upstream provider")를 확인했지만 두 값이 왜 다른지는 명시되어 있지 않아 **추가 확인**으로 남김 (마진/surcharge 차이로 추정되나 미확정)
+
+**대체 동작**: provider별 단가 조인이 불가능한 환경(예: provider 목록 미캐싱)이라면, 재계산 없이 **응답에 포함된 `cost`/`usage.cost` 값을 그대로 신뢰해서 저장**하는 것으로 충분합니다 — 재계산은 감사(audit)용이지 필수가 아닙니다.
+
+**PoC 완료조건에 미치는 영향**: 비용 필드 자체(`cost`)는 추가 검증 없이 그대로 저장해도 안전하다는 게 확인되어, PoC 단계에서는 "비용 재계산 로직"을 필수 구현 범위에서 제외해도 됩니다. 다만 "즉시 반영 여부"가 미확정이라, PoC가 "호출 직후 정확한 비용을 사용자에게 바로 보여줘야 한다"는 요구사항을 포함한다면 이 부분은 별도로 검증 후 범위에 넣어야 합니다.
 
 **출처**: https://openrouter.ai/docs/api/api-reference/generations/get-request-&-usage-metadata-for-a-generation.md
 
@@ -168,12 +183,27 @@ GET https://openrouter.ai/api/v1/generation?id=gen-...
 - `prompt_tokens_details.cached_tokens`(int), `cache_write_tokens`(int, 두 호출 모두 0으로 관측)
 - `completion_tokens_details.reasoning_tokens`(int) — 별도 파라미터 없이 기본 집계됨
 
+**⚠️ 토큰 포함 관계 (중요, DB 합산 시 주의)**
+- `cached_tokens`는 `prompt_tokens`에 **포함된** 값이지, 별도로 추가되는 값이 아님
+- `reasoning_tokens`는 `completion_tokens`에 **포함된** 값이지, 별도로 추가되는 값이 아님
+- 근거: 캐시 적중 여부(1차 `cached_tokens=0` vs 2차 `cached_tokens=3584`)와 무관하게 `total_tokens`가 1차·2차 모두 동일하게 `3722`(=`3622+100`)로 유지됨. `cached_tokens`가 별도 합산되는 값이었다면 2차에서 `total_tokens`가 더 커졌어야 하는데 그렇지 않음 → 세부 필드는 상위 토큰 수의 "내역(breakdown)"이지 "추가분"이 아님
+- **DB 설계 시 `prompt_tokens + cached_tokens`, `completion_tokens + reasoning_tokens`처럼 더해서 합산하면 토큰 수가 중복 계산됨** — 상위 값(`prompt_tokens`, `completion_tokens`)만 합계에 쓰고, 하위 필드는 "그중 얼마가 캐시/reasoning이었는지" 설명용 컬럼으로 별도 취급해야 함
+
 **DB 설계에 미치는 영향**
 - 캐시 적중 시(`cached_tokens: 3584` / 전체 3622) 비용이 **약 73% 절감**(8.24e-05 → 2.22e-05)됨 → 캐시 적중률과 절감액을 계산하려면 `cached_tokens`와 `cost`를 함께 저장해야 함
 - `reasoning_tokens`는 모델에 따라 파라미터 지정 없이도 기본 발생 → reasoning 전용 플래그만으로는 발생 여부를 판단할 수 없음
 
+**⚠️ max_tokens 주의사항**
+- 이번 두 호출 모두 `finish_reason: "length"`로 끝남 (`max_tokens=100` 제한에 걸려 **응답이 문장 중간에 잘림** — 정상 종료 `"stop"`이 아님). 실제 응답 내용도 "요약할 글이 제공되지 않았습니다..."처럼 미완성 상태로 끝남
+- reasoning을 하는 모델은 `completion_tokens` 안에서 **reasoning_tokens(87~82)가 먼저 소비되고 남은 토큰으로 실제 답변을 생성**하므로, `max_tokens`를 너무 작게 주면 reasoning만 하다가 답변이 잘릴 수 있음
+- **DB/서비스 설계 시: reasoning 지원 모델을 호출할 때는 reasoning 소비분을 감안해 `max_tokens`를 넉넉히 설정해야 답이 안 잘림** (이번 테스트는 비용 절감을 위해 의도적으로 100으로 제한했던 것이라 실제 서비스 값은 아님)
+
 **추가 확인**
 - `cache_write_tokens`가 두 호출 모두 0으로 관측됨 — 캐시 쓰기 비용이 과금되는 모델/provider가 있는지는 이번 테스트로 미확인
+
+**대체 동작**: 캐시를 지원하지 않는 모델/provider라면 `cached_tokens`가 항상 0으로만 나오고 나머지 응답 구조는 동일함 — 별도 분기 처리 없이 같은 코드 경로로 처리 가능
+
+**PoC 완료조건에 미치는 영향**: 캐시는 선택적 최적화(비용 절감 지표)로 취급 가능하며 PoC 필수 요구사항은 아님. 다만 reasoning 모델을 PoC에서 실제로 쓴다면, `max_tokens`를 작게 잡았을 때 "응답이 잘렸는지"(`finish_reason`) 체크 로직은 필수로 넣어야 함 — 안 그러면 완성되지 않은 답을 사용자에게 그대로 보여줄 위험이 있음
 
 **출처**: https://openrouter.ai/docs/guides/best-practices/prompt-caching.md
 
@@ -257,6 +287,10 @@ API-02/04에서 생성된 기존 id 3개 + 존재하지 않는 가짜 id 1개로
 
 **추가 확인**
 - 이번 세션에서 만든 id들만 테스트 가능했음 (최대 1시간 이내) → 수일~수주 전 과거 호출까지 조회 가능한지는 확인 못함
+
+**대체 동작**: 만료/미존재 id는 명확한 404라서, 애플리케이션은 이를 "데이터 없음"으로 처리하고 재시도하지 않으면 됨
+
+**PoC 완료조건에 미치는 영향**: 장기 보존 기간이 불확실하므로, PoC가 "과거 호출을 몇 달 뒤에도 OpenRouter API로 직접 재조회"하는 걸 전제로 설계하면 위험함 — **호출 직후 받은 데이터를 자체 DB에 즉시 저장(미러링)하는 구조가 필요**하며, OpenRouter의 `/generation`을 장기 보관소로 의존하면 안 됨
 
 **출처**: https://openrouter.ai/docs/api/api-reference/generations/get-request-&-usage-metadata-for-a-generation.md
 
@@ -352,6 +386,10 @@ API-02/04에서 생성된 기존 id 3개 + 존재하지 않는 가짜 id 1개로
 - 기본값으로는 미지원 모델이 **에러 없이 조용히 무시**하고 임의 구조로 응답함 → 응답 스키마 일치 여부를 애플리케이션에서 별도 검증하지 않으면 잘못된 데이터가 그대로 저장될 위험
 - `provider.require_parameters: true`를 사용하면 미지원 provider/모델을 라우팅 단계에서 걸러 **명시적 404 에러**로 전환됨 → 구조화된 응답이 필수인 기능에는 이 옵션을 기본값으로 사용 권장
 
+**대체 동작**: `require_parameters: true`로 404를 받으면, 애플리케이션은 (1) 해당 모델을 호출 가능 목록에서 제외하거나 (2) 스키마 요구를 포기하고 자유 텍스트 응답을 받아 별도 파싱 로직으로 대체 — 둘 중 하나를 선택해야 함 (무시하고 재시도하면 같은 에러만 반복됨)
+
+**PoC 완료조건에 미치는 영향**: 사용자가 임의의 모델을 고를 수 있는 PoC라면, "구조화 응답이 필요한 기능"에서는 **모델 선택지를 `supported_parameters`에 `response_format`/`structured_outputs`가 있는 모델로 제한**하거나, `require_parameters: true` + 에러 핸들링을 처음부터 구현 범위에 포함해야 함 — 나중에 추가하면 이미 저장된 잘못된 형식의 데이터를 정리해야 할 수 있음
+
 **출처**: https://openrouter.ai/docs/guides/features/structured-outputs.md , https://openrouter.ai/docs/guides/routing/provider-selection.md
 
 ---
@@ -394,13 +432,17 @@ API-02/04에서 생성된 기존 id 3개 + 존재하지 않는 가짜 id 1개로
 **추가 확인**
 - `image_tokens` 필드가 이번 테스트 모델에서는 항상 0으로 나옴 — 다른 모델/provider에서 분리 집계되는지 미확인
 
+**대체 동작**: 이미지 미지원 모델은 404로 명확히 구분되므로, 애플리케이션은 "이 모델은 이미지를 지원하지 않습니다" 같은 메시지로 바로 분기 처리 가능
+
+**PoC 완료조건에 미치는 영향**: 원본 파일 용량이 비용에 비례하지 않는 것으로 보여, PoC에서 업로드 용량별 비용 추정 로직을 따로 만들 필요는 없어 보임 (다만 이번 테스트는 모델 1종 기준이라 다른 모델/provider에서도 동일한지는 확장 검증 필요)
+
 **출처**: https://openrouter.ai/docs/guides/overview/multimodal/image-understanding.md
 
 ---
 
 ## API-11. 실패·Timeout 호출의 비용 대조 가능 여부
 
-**결과: 지원** (지연 과금 가능성 확인됨, "과금 없음"을 가정하지 않고 실측으로 검증)
+**결과: 부분 지원** (지연 과금 가능성은 확인됨, 그러나 **호출 단위로 비용을 대조하는 것까지는 안 됨**)
 
 **확인 방법**
 1. Baseline `GET /key` 사용량 확인
@@ -421,13 +463,32 @@ API-02/04에서 생성된 기존 id 3개 + 존재하지 않는 가짜 id 1개로
 - 즉시 실패(400)·timeout(클라이언트 레벨)은 **과금되지 않음이 즉시 확인**됨
 - 그러나 90초 뒤 usage가 미세하게 증가(delta 약 2.64e-07) → **지연 과금이 실제로 존재함을 확인**
 
+**⚠️ 왜 "부분 지원"으로 정정했는가**
+- 계정 전체 사용량(`/key`)으로는 "뭔가 지연 과금이 있었다"는 **변화 감지는 가능**했음
+- 그러나 **호출 단위(개별 call)로 어떤 호출이 그 비용을 발생시켰는지 대조는 안 됨**: 스트리밍 abort 건의 `/generation` 조회가 `404`라서, 계정 레벨 usage 증가분을 특정 호출 레코드와 연결할 방법이 없었음
+- 즉 "지연 과금이 존재한다"는 알 수 있지만, "어떤 호출 때문에 얼마가 더 나갔다"를 영수증처럼 대조하는 것은 **이번 테스트로는 불가능** → 원래 질문("호출별 비용 대조 가능 여부")에 대해서는 **부분 지원**이 더 정확한 분류
+
+**⚠️ Timeout 테스트(0.01초)의 한계**
+- 클라이언트 타임아웃을 0.01초로 잡았는데, 이건 TLS 핸드셰이크·네트워크 왕복 시간보다도 짧을 수 있어서 **요청이 OpenRouter 서버에 실제로 도달하기도 전에 클라이언트가 먼저 끊었을 가능성이 있음**
+- 즉 이번 timeout 테스트는 "서버가 처리를 시작한 뒤 끊긴 경우"를 재현한 게 아니라 "애초에 서버에 안 닿았을 가능성이 있는 경우"를 테스트했을 수 있어서, **"서버 처리 중 timeout" 시나리오를 제대로 검증했다고 보기 어려움**
+
 **DB 설계에 미치는 영향**
 - 실패/중단된 호출이라도 **지연되어 과금될 수 있음**이 실측으로 확인됨 → 호출 성공 여부와 무관하게 비용 필드는 "즉시 확정"이 아니라 **비동기로 재조회/정산해야 하는 값**으로 설계 필요
-- key 사용량 집계(`/key`)와 generation 상세 조회(`/generation`)가 서로 다른 시점에 갱신될 수 있음 (abort된 요청은 usage엔 반영됐지만 generation 조회는 404) → 두 데이터 소스를 동일 기준으로 취급하면 안 됨
+- key 사용량 집계(`/key`)와 generation 상세 조회(`/generation`)가 서로 다른 시점/기준으로 갱신될 수 있고, **개별 호출에 비용을 귀속시키지 못하는 경우가 실제로 있음** → 비용 원장(ledger) 테이블은 호출 시점에 `UNKNOWN` 상태로 먼저 기록하고, 이후 재조회로 금액이 확정되면 `reconciled_at` 같은 필드로 갱신하는 **비동기 정산 구조**가 필요함. 개별 호출에 끝내 귀속이 안 되는 금액(계정 레벨에서만 보이는 차액)이 생길 수 있다는 점도 설계에 반영 필요
 
 **추가 확인**
-- 지연 과금 증가분(2.64e-07)의 정확한 원인이 **timeout 케이스인지 스트리밍 abort 케이스인지는 이번 테스트로 분리되지 않음** (두 호출이 연속으로 이뤄져 개별 귀속 불가). DB 설계에는 영향 없음(둘 다 "지연 재조회 필요" 케이스로 동일 처리) — 원인 분리가 필요하면 각 케이스를 독립적으로 재테스트 필요
+- 지연 과금 증가분(2.64e-07)의 정확한 원인이 **timeout 케이스인지 스트리밍 abort 케이스인지는 이번 테스트로 분리되지 않음** (두 호출이 연속으로 이뤄져 개별 귀속 불가)
 - 실제 Provider 서버 다운/네트워크 장애는 재현 불가 → **추가 확인**
+
+**재테스트 계획 (실행은 보류, 계획만 기록)**
+1. Timeout을 0.01초가 아니라 **2~3초**로 설정 — 서버가 요청을 받아 처리를 시작할 시간은 확보하되, 응답 전에 끊기도록 함
+2. Timeout 케이스와 스트리밍 abort 케이스를 **완전히 분리된 시간대에 각각 단독으로** 테스트 (서로 영향 안 주도록)
+3. 각 케이스마다 baseline → 호출 직후 → **1~2분 뒤** usage를 개별적으로 확인해서, 어느 케이스가 지연 과금을 유발하는지 분리
+4. 위 결과가 나오면 본 보고서 업데이트 예정
+
+**대체 동작**: 개별 호출 귀속이 실패하는 경우(계정 레벨 usage는 늘었는데 특정 generation을 못 찾는 경우), 애플리케이션은 그 차액을 "미귀속 비용"으로 별도 집계하고 주기적으로 사람이 확인하는 운영 프로세스를 두는 것을 대체 방안으로 고려할 수 있음
+
+**PoC 완료조건에 미치는 영향**: 비용 원장 테이블 스키마에 `status`(UNKNOWN/CONFIRMED 등)와 `reconciled_at` 필드가 **처음부터** 포함되어야 함 — 나중에 추가하면 이미 쌓인 데이터를 마이그레이션해야 해서 설계 초기 단계에 반영돼야 하는 항목임. 또한 "모든 호출의 비용을 100% 개별 귀속시킨다"는 요구사항은 이번 테스트 결과상 **보장할 수 없는 목표**이므로, PoC 완료조건에서 이 부분은 "best-effort"로 조정하거나 미귀속분 처리 정책을 별도로 정해야 함
 
 **출처**: https://openrouter.ai/docs/api_reference/streaming.md
 
@@ -447,6 +508,6 @@ API-02/04에서 생성된 기존 id 3개 + 존재하지 않는 가짜 id 1개로
 |API-08 Provider 고정·Fallback|지원|
 |API-09 JSON Schema|부분 지원 (require_parameters로 보강 가능)|
 |API-10 이미지 입력|지원|
-|API-11 실패·Timeout 비용|지원 (지연 과금 확인, 원인 세부 분리는 추가확인)|
+|API-11 실패·Timeout 비용|**부분 지원** (지연 과금은 확인, 호출 단위 대조는 불가 — 재테스트 계획 수립됨)|
 
 **총 검증 비용**: 약 $0.00014 (한도 $50 중)
